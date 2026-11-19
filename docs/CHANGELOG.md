@@ -12,6 +12,13 @@ notes, with its device-test steps, are in the git history (`docs/history/`, befo
 
 Volume sync and AAC are standard.
 
+- **The stream no longer drops after a quiet spell.** When Windows resumes after a pause it can send several
+  seconds of pure digital silence. The helper trims that silence so the music starts without a delay, but it
+  reported itself as playing with nothing rendered. So Speaka's health lease lapsed 1.5 s in, and iOS's own idle
+  check suspended the stream from the iPhone 6-12 s later, which looks to Windows like the speaker going away (18
+  Nov: 22:56:51, 22:57:36 and 23:01:06, each after Windows had restarted the stream). Trimming now counts as
+  holding the output on purpose, like an interruption or a starved input, so the lease lasts as long as Windows
+  keeps sending (`health_holding`, `OutputPolicy.h`).
 - **Uninstall asks with a window instead of a hold.** Tapping Uninstall opens a confirmation over the whole screen:
   Speaka's icon, *Remove Speaka from this iPhone?*, what it removes in the order it removes it, then **Uninstall**
   and **Cancel**. Uninstall runs the same removal as before, and the row still shows *Uninstalling...* while it runs.

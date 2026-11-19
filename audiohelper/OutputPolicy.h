@@ -361,10 +361,25 @@ static inline int input_rate_add(input_rate_t *r, unsigned frames, unsigned outp
  * input can't sustain playback - nothing renders, so the helper reports "holding" with its decoded-frame count:
  * the lease then lasts exactly as long as the stream is still being received and decoded. v9.8.90 covered only the
  * pause; its input gate reported "playing" with a frozen render count, the lease lapsed 1.5 s into every gated
- * stretch (12:05:57, 12:07:08), and Apple's A2DP code suspended the stream ~10 s later. */
-static inline int health_holding(int stream_active, int has_queue, int paused, int input_starved)
+ * stretch (12:05:57, 12:07:08), and Apple's A2DP code suspended the stream ~10 s later.
+ *
+ * The third way the output is held on purpose: a warm resume drops Windows' leading digital silence until the first
+ * real sample (v9.9.4, `trimming`). After a quiet spell Windows can send nothing but silence for many seconds, and
+ * that trim reported "playing" with a frozen render count too: the 18 Nov log, START at 23:00:54.799, the lease
+ * lapsed at 23:00:56.544, and the iPhone suspended the stream at 23:01:06.810 - three times in five minutes, each
+ * looking to Windows like the speaker going away. Trimming now reports holding, like the other two. */
+static inline int health_holding(int stream_active, int has_queue, int paused, int input_starved, int trimming)
 {
-    return stream_active && has_queue && (paused || input_starved);
+    return stream_active && has_queue && (paused || input_starved || trimming);
+}
+
+/* Whether decoded PCM is digital silence: every sample exactly zero (`frames` stereo frames). A warm resume drops it
+ * until the first real sample (v9.9.4). */
+static inline int pcm_digital_silence(const int16_t *pcm, unsigned frames)
+{
+    for (unsigned i = 0; i < frames * 2u; i++)
+        if (pcm[i] != 0) return 0;
+    return 1;
 }
 
 /* Mark a freshly reset stream as a warm resume (v9.9.4). */

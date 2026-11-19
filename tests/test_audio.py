@@ -781,6 +781,107 @@ int main(void) {
             self.assertEqual(ran.returncode,0,ran.stdout+ran.stderr)
             print(ran.stdout,end="")
 
+    def test_trimmed_silence_keeps_the_stream_lease_end_to_end(self):
+        """The 18 Nov failure, end to end: after a quiet spell Windows resumes the stream (a warm resume) and sends only
+        digital silence for 12 s, then real audio, then nothing. Through the real render callback, PCM writers, silence
+        trim and health_holding decision, and the real lease (tweak/Tweak.h), reporting every 200 ms. The old report
+        (the trim counted as playing) must reproduce the device: START at 23:00:54.799, lease lapsed at 23:00:56.544.
+        The fix must keep the lease while the silence is received and decoded, keep it as real audio takes over, and
+        still let it lapse once the input stops."""
+        source = SOURCE.read_text()
+        render = source.split("#define PCM_CAPACITY", 1)[1].split("static void stop_output", 1)[0]
+        writers = source.split("static void hold_pcm(", 1)[1].split("static void keep_output(", 1)[0]
+        harness = r"""
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <pthread.h>
+typedef int32_t OSStatus;
+typedef void *AudioQueueRef;
+typedef struct { void *mAudioData; uint32_t mAudioDataByteSize; } AudioQueueBuffer;
+typedef AudioQueueBuffer *AudioQueueBufferRef;
+static OSStatus AudioQueueEnqueueBuffer(AudioQueueRef q,AudioQueueBufferRef b,unsigned p,const void *d){(void)q;(void)b;(void)p;(void)d;return 0;}
+#define PCM_CAPACITY""" + render + "static void hold_pcm(" + writers + r"""
+#include "OutputPolicy.h"
+#include "tweak/Tweak.h"
+typedef struct { long first_unready_in_silence, unready_after_stop; unsigned unready_reports_music; uint64_t trimmed,
+                 rendered_after_music; } R;
+/* Phases: 0-12 s Windows sends digital silence in real time (the warm resume trims it), 12-20 s real audio,
+ * 20-23 s nothing arrives (the stream is still active). */
+static R run(int fixed) {
+    static Output o; memset(&o,0,sizeof o); pthread_mutex_init(&o.lock,NULL); o.priming=1;
+#ifdef PCM_PRIME_WARM
+    o.prime_target=PCM_PRIME_WARM;
+#endif
+    o.trim_silence=1;
+    int16_t silence[2048], music[2048];
+    memset(silence,0,sizeof silence); for (int i=0;i<2048;i++) music[i]=1000;
+    int16_t data[AUDIO_FRAMES*2]; AudioQueueBuffer buf={data,0};
+    SinkHealth h; sink_health_reset(&h,3,0,0);
+    uint64_t media=0, beat=0, next_pkt=0, next_render=0, rendered_at_music=0; double sched=0;
+    R r={-1,-1,0,0,0};
+    for (uint64_t t=0; t<23000000; t+=1000) {
+        double sec=t/1e6;
+        if (sec<20.0 && t>=next_pkt) {                     /* a packet: counted, decoded, then trimmed or written */
+            const int16_t *pcm = sec<12.0 ? silence : music;
+            media++;
+            o.decoded_frames+=1024;
+            int keep=1;
+            if (o.trim_silence) { if (pcm_digital_silence(pcm,1024)) keep=0; else o.trim_silence=0; }
+            if (keep) write_pcm(&o,(int16_t *)pcm,1024); else r.trimmed+=1024;
+            sched+=1e6/46.875; next_pkt=(uint64_t)sched;
+        }
+        if (t%5000==0) beat++;                             /* the helper's loop heartbeat */
+        if (t>=next_render) { render(&o,&o,&buf); next_render+=10667; }
+        if (sec>=12.0 && !rendered_at_music) rendered_at_music=o.render_tick+1;
+        if (t%200000==0 && t>0) {                          /* report_health every 200 ms -> the relay's lease */
+            int holding = health_holding(1,1,(int)o.paused,(int)o.input_starved,fixed?(int)o.trim_silence:0);
+            uint32_t counter = holding ? o.decoded_frames : (uint32_t)o.render_tick;
+            sink_health_sample(&h,media,beat,t/1000);
+            sink_health_render(&h,3,counter,holding?2u:1u,t/1000);
+            int ready=sink_health_ready(&h,1,t/1000);
+            if (!ready && sec>1.0 && sec<12.0 && r.first_unready_in_silence<0) r.first_unready_in_silence=(long)(t/1000);
+            if (!ready && sec>=12.0 && sec<20.0) r.unready_reports_music++;
+            if (!ready && sec>=20.0 && r.unready_after_stop<0) r.unready_after_stop=(long)(t/1000)-20000;
+        }
+    }
+    r.rendered_after_music=o.render_tick-(rendered_at_music-1);
+    pthread_mutex_destroy(&o.lock);
+    return r;
+}
+int main(void) {
+    (void)hold_pcm;                                     /* lifted with write_pcm; this replay never holds */
+    R old=run(0), now=run(1);
+    printf("before: lease lapsed %ld ms after Windows resumed with silence\n", old.first_unready_in_silence);
+    printf("fixed:  lapsed in silence: %s, unready during music: %u, lapsed %ld ms after the input stopped,"
+           " trimmed %llu frames, rendered %llu ticks of music\n", now.first_unready_in_silence<0?"never":"YES",
+           now.unready_reports_music, now.unready_after_stop, (unsigned long long)now.trimmed,
+           (unsigned long long)now.rendered_after_music);
+    assert(old.first_unready_in_silence>=1000 && old.first_unready_in_silence<=2200);   /* 23:00:54.799 -> 56.544 */
+    assert(now.first_unready_in_silence<0);              /* healthy while Windows' silence is received and decoded */
+    assert(now.trimmed>=48000u*11u);                     /* ... and the silence is still trimmed, not played */
+    assert(now.unready_reports_music==0);                /* real audio takes over without a gap in the lease */
+    assert(now.rendered_after_music>500);                /* ... and it is really played */
+    assert(now.unready_after_stop>=0 && now.unready_after_stop<=1900);   /* the input stopping still lapses it */
+    return 0;
+}
+"""
+        cc = shutil.which("cc"); self.assertIsNotNone(cc)
+        flags = ["-std=gnu11","-O2","-Wall","-Wextra","-Werror","-pthread","-I"+str(ROOT/"audiohelper"),"-I"+str(ROOT)]
+        with tempfile.TemporaryDirectory() as td:
+            c = pathlib.Path(td)/"trim.c"; exe = pathlib.Path(td)/"trim"; c.write_text(VOLUME_SUPPORT + harness)
+            built = subprocess.run([cc,*flags,str(c),"-o",str(exe)],capture_output=True,text=True,timeout=60)
+            self.assertEqual(built.returncode,0,built.stdout+built.stderr)
+            ran = subprocess.run([str(exe)],capture_output=True,text=True,timeout=60)
+            self.assertEqual(ran.returncode,0,ran.stdout+ran.stderr)
+            print(ran.stdout,end="")
+        # The helper reports the trim (atomically: report_health runs apart from the decoder) and trims with the policy.
+        self.assertIn("(int)__atomic_load_n(&o->trim_silence,__ATOMIC_RELAXED))) {", source)
+        self.assertIn("if(pcm_digital_silence(pcm,samples)) keep=0;", source)
+        self.assertLess(source.index("__atomic_fetch_add(&o->decoded_frames,samples,__ATOMIC_RELAXED);"),
+                        source.index("if(pcm_digital_silence(pcm,samples)) keep=0;"))   # trimmed frames still count
+
     def test_gated_output_keeps_the_stream_lease_end_to_end(self):
         """The v9.8.90 failure, end to end: START, then input at ~44% of real time (12:05:55: 21397/48000), then real
         time, then the input stops. Through the real render callback, PCM writers and input monitor, the real
@@ -836,7 +937,7 @@ static R run(int fixed) {
         }
         if (t>=next_render) { render(&o,&o,&buf); next_render+=10667; }
         if (t%200000==0 && t>0) {                          /* report_health every 200 ms -> the relay's lease */
-            int holding = fixed ? health_holding(1,1,(int)o.paused,(int)o.input_starved) : (int)o.paused;
+            int holding = fixed ? health_holding(1,1,(int)o.paused,(int)o.input_starved,0) : (int)o.paused;
             uint32_t counter = holding ? o.decoded_frames : (uint32_t)o.render_tick;
             sink_health_sample(&h,media,beat,t/1000);
             sink_health_render(&h,3,counter,holding?2u:1u,t/1000);
@@ -926,7 +1027,7 @@ static R run(int v994) {
                 int c=input_rate_add(&in,1024,48000,t/1000);
                 if (c>0) r.gated++;
                 int keepit=1;
-                if (v994 && o.trim_silence) { int all=1; for (int i=0;i<2048 && all;i++) all=pcm[i]==0; if (all) keepit=0; else o.trim_silence=0; }
+                if (v994 && o.trim_silence) { if (pcm_digital_silence(pcm,1024)) keepit=0; else o.trim_silence=0; }
                 if (keepit) write_pcm(&o,pcm,1024);
                 /* The measured gaps (clumps of two included), scaled to a real-time mean: they average 21.71 ms,
                  * and a live stream averages 21.33 ms (1024 frames at 48 kHz). */
@@ -994,7 +1095,7 @@ int main(void) {
         helper = source
         loop = between(helper, "for(;;) {", "[[NSNotificationCenter defaultCenter] removeObserver:observer];")
         generation = between(loop, "if(current!=generation) {", "\n            }\n")
-        for line in ("if(warm) input_rate_warm(&input);", "o->prime_target=warm?PCM_PRIME_WARM:PCM_PRIME;o->trim_silence=warm&&(current&1u);"):
+        for line in ("if(warm) input_rate_warm(&input);", "o->prime_target=warm?PCM_PRIME_WARM:PCM_PRIME;__atomic_store_n(&o->trim_silence,(unsigned)(warm&&(current&1u)),__ATOMIC_RELAXED);"):
             self.assertIn(line, generation)
 
     def test_speaker_route_and_teardown_guards(self):
@@ -1495,18 +1596,23 @@ int main(void) {
 #include <assert.h>
 #include "OutputPolicy.h"
 int main(void) {
-    assert(health_holding(1,1,0,1) == 1);     /* gated on a starved input, stream active: holding */
-    assert(health_holding(1,1,1,0) == 1);     /* paused by an interruption, stream active: holding */
-    assert(health_holding(1,1,0,0) == 0);     /* playing normally: the render-based report applies */
-    assert(health_holding(0,1,1,1) == 0);     /* Windows paused the stream: never holding, whatever the flags */
-    assert(health_holding(1,0,0,1) == 0);     /* no queue: nothing is held */
+    assert(health_holding(1,1,0,1,0) == 1);   /* gated on a starved input, stream active: holding */
+    assert(health_holding(1,1,1,0,0) == 1);   /* paused by an interruption, stream active: holding */
+    assert(health_holding(1,1,0,0,1) == 1);   /* trimming Windows' leading silence (warm resume): holding */
+    assert(health_holding(1,1,0,0,0) == 0);   /* playing normally: the render-based report applies */
+    assert(health_holding(0,1,1,1,1) == 0);   /* Windows paused the stream: never holding, whatever the flags */
+    assert(health_holding(1,0,0,1,1) == 0);   /* no queue: nothing is held */
+    int16_t quiet[8] = {0}, sound[8] = {0, 0, 0, 0, 0, 3, 0, 0};
+    assert(pcm_digital_silence(quiet, 4) == 1 && pcm_digital_silence(sound, 4) == 0);
+    assert(pcm_digital_silence(sound, 2) == 1);   /* only the frames given are examined */
     return 0;
 }
 """)
         helper = read("audiohelper/AudioHelper.m")
         health = between(helper, "static void report_health(Output *o,AudioRing *s,uint64_t generation) {", "\n}\n")
         self.assertIn("if(health_holding((generation&1u)!=0,o->queue!=NULL,(int)o->paused,", health)
-        self.assertIn("(int)__atomic_load_n(&o->input_starved,__ATOMIC_RELAXED))) {", health)
+        self.assertIn("(int)__atomic_load_n(&o->input_starved,__ATOMIC_RELAXED),\n"
+                      "                      (int)__atomic_load_n(&o->trim_silence,__ATOMIC_RELAXED))) {", health)
         self.assertIn("__atomic_load_n(&o->decoded_frames,__ATOMIC_RELAXED),2});", health)
         self.assertIn("(uint32_t)__atomic_load_n(&o->render_tick,__ATOMIC_RELAXED),why?-(int32_t)why:1});", health)
         relay = read("tweak/AudioRelay.c")

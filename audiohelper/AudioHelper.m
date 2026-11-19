@@ -682,7 +682,8 @@ static void report_health(Output *o,AudioRing *s,uint64_t generation) {
      * keeps the stream exactly as long as the helper keeps receiving and decoding it, and no longer (OutputPolicy.h,
      * health_holding). Gated, the queue still runs, so v9.8.90 reported "playing" with a frozen render count. */
     if(health_holding((generation&1u)!=0,o->queue!=NULL,(int)o->paused,
-                      (int)__atomic_load_n(&o->input_starved,__ATOMIC_RELAXED))) {
+                      (int)__atomic_load_n(&o->input_starved,__ATOMIC_RELAXED),
+                      (int)__atomic_load_n(&o->trim_silence,__ATOMIC_RELAXED))) {
         audio_ring_event(s,1,(AudioRingEvent){RING_EVENT_HEALTH,(uint32_t)generation,
             __atomic_load_n(&o->decoded_frames,__ATOMIC_RELAXED),2});
         return;
@@ -969,7 +970,7 @@ static void stream(int fd) {
                  * silence trimmed; a cold stream keeps the 0.25 s lead and the early starvation verdict. */
                 if(warm) input_rate_warm(&input);
                 pthread_mutex_lock(&o->lock);
-                o->prime_target=warm?PCM_PRIME_WARM:PCM_PRIME;o->trim_silence=warm&&(current&1u);
+                o->prime_target=warm?PCM_PRIME_WARM:PCM_PRIME;__atomic_store_n(&o->trim_silence,(unsigned)(warm&&(current&1u)),__ATOMIC_RELAXED);
                 pthread_mutex_unlock(&o->lock);
                 healthy_since=0;
                 if(!(current&1u)) publish_status(@"idle",@"PC paused or stopped the stream",NO);
@@ -1107,11 +1108,12 @@ static void stream(int fd) {
                     }
                     /* v9.9.4: a warm resume starts with Windows' silent frames (14:52:14: four 16-byte packets, ~85 ms);
                      * playing them only delays the music, so digital silence is dropped until the first real sample. */
+                    /* While trimming, the helper reports holding with this decode progress (report_health), so the
+                     * idle guard keeps the stream: Windows' silence is still a live stream (OutputPolicy.h). */
                     int keep=1;
-                    if(o->trim_silence) {
-                        int silent=1;
-                        for(unsigned k=0;k<samples*2u && silent;k++) silent=pcm[k]==0;
-                        if(silent) keep=0; else o->trim_silence=0;
+                    if(__atomic_load_n(&o->trim_silence,__ATOMIC_RELAXED)) {
+                        if(pcm_digital_silence(pcm,samples)) keep=0;
+                        else __atomic_store_n(&o->trim_silence,0u,__ATOMIC_RELAXED);
                     }
                     /* v9.9.2: held (input starved, or paused by an interruption): keep only the newest lead. */
                     if(keep && o->queue && (o->paused || __atomic_load_n(&o->input_starved,__ATOMIC_RELAXED))) hold_pcm(o,pcm,samples);
